@@ -1,0 +1,29 @@
+[project]
+name = "reva"
+version = "0.1.0"
+description = "REVA post-retrieval RAG context compression pipeline."
+requires-python = ">=3.10,<3.13"
+dependencies = [
+    "accelerate>=1.0,<2",
+    "protobuf>=5,<7",
+    "rouge>=1.0.1,<2",
+    "safetensors>=0.7,<1",
+    "sentencepiece>=0.2.1,<0.3",
+    "torch>=2.11,<2.12",
+    "transformers @ git+https://github.com/huggingface/transformers.git@a29df2d916e3b820aecd19d3b5a877abc523ba3c",
+]
+
+[project.optional-dependencies]
+baselines = [
+    "llmlingua>=0.2.2,<0.3",
+    "peft>=0.19,<0.20",
+    "selective-context>=0.1.4,<0.2",
+]
+retrieval = [
+    "faiss-cpu>=1.8,<2",
+    "huggingface-hub>=1.5,<2",
+    "numpy>=1.26,<3",
+]
+
+[tool.uv]
+package = false
