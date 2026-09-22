@@ -29,6 +29,12 @@ def build_record(
     }
     if result.meta:
         record["compression_meta"] = result.meta
+    if example.dataset is not None:
+        record["dataset"] = example.dataset
+    if example.split is not None:
+        record["split"] = example.split
+    if example.source_response:
+        record["source_response"] = example.source_response
     if generation:
         record.update(generation)
         record.update(score(generation["prediction"], example.answers))
@@ -45,6 +51,9 @@ def run(
     limit: int | None = None,
     top_k: int | None = None,
     max_new_tokens: int = 32,
+    corpus_path: str | Path | None = None,
+    dataset: str | None = None,
+    split: str | None = None,
 ) -> dict[str, Any]:
     if budget is not None and budget < 0:
         raise ValueError("budget must be non-negative")
@@ -53,13 +62,14 @@ def run(
     if top_k is not None and top_k < 0:
         raise ValueError("top_k must be non-negative")
 
-    examples = load_examples(input_path, limit, top_k)
+    examples = load_examples(input_path, limit, top_k, corpus_path, dataset, split)
     output_dir = Path(output_dir).expanduser()
     output_dir.mkdir(parents=True, exist_ok=True)
 
     generator = load_model(model_name) if model_name else None
     tokenizer = None if generator is None else generator.tokenizer
-    compressor = get_compressor(CompressionConfig(method, budget, options or {}), tokenizer, model_name)
+    contexts = [context for example in examples for context in example.contexts]
+    compressor = get_compressor(CompressionConfig(method, budget, options or {}), tokenizer, model_name, contexts)
 
     records = []
     for example in examples:

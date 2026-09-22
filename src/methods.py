@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from schema import CompressionConfig, Compressor
+from schema import CompressionConfig, Compressor, Context
 
 METHODS = [
     "raw",
@@ -27,7 +27,12 @@ def list_methods() -> list[str]:
     return list(METHODS)
 
 
-def get_compressor(config: CompressionConfig, tokenizer: Any | None = None, model_name: str | None = None) -> Compressor:
+def get_compressor(
+    config: CompressionConfig,
+    tokenizer: Any | None = None,
+    model_name: str | None = None,
+    contexts: list[Context] | None = None,
+) -> Compressor:
     from baselines import (
         CompActCompressor,
         ExitCompressor,
@@ -62,4 +67,6 @@ def get_compressor(config: CompressionConfig, tokenizer: Any | None = None, mode
         "longrefiner": LongRefinerCompressor,
         "compact": CompActCompressor,
     }
+    if config.method == "reva":
+        return REVAOfflineCompressor(config, tokenizer, model_name, contexts)
     return classes[config.method](config, tokenizer, model_name)

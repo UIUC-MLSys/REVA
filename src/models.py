@@ -28,12 +28,13 @@ class Generator:
 def build_prompt(example: Example, context_text: str, tokenizer: Any | None = None) -> str:
     system = SYSTEM_PROMPT.format(reference=context_text.strip())
     user = USER_PROMPT.format(question=example.question.strip())
-    if tokenizer is None or not hasattr(tokenizer, "apply_chat_template"):
+    if tokenizer is None or not getattr(tokenizer, "chat_template", None):
         return "\n\n".join([system, user]).strip()
     return tokenizer.apply_chat_template(
         [{"role": "system", "content": system}, {"role": "user", "content": user}],
         tokenize=False,
         add_generation_prompt=True,
+        enable_thinking=False,
     )
 
 
@@ -48,24 +49,31 @@ def load_model(model_name: str) -> Generator:
         trust_remote_code=True,
     )
     model.eval()
-    max_length = int(getattr(model.config, "max_position_embeddings", 4096))
+    max_length = int(getattr(model.config.get_text_config(), "max_position_embeddings", 4096))
     return Generator(tokenizer, model, next(model.parameters()).device, max_length)
 
 
 def generate(generator: Generator, prompt: str, max_new_tokens: int = 32) -> dict[str, Any]:
-    encoded = generator.tokenizer(prompt, return_tensors="pt").to(generator.device)
+    encoded = generator.tokenizer(
+        prompt,
+        return_tensors="pt",
+        add_special_tokens=not bool(getattr(generator.tokenizer, "chat_template", None)),
+    ).to(generator.device)
     budget = max(1, generator.max_length - max_new_tokens)
     if encoded["input_ids"].shape[-1] > budget:
         encoded["input_ids"] = encoded["input_ids"][:, -budget:]
         encoded["attention_mask"] = encoded["attention_mask"][:, -budget:]
     prompt_len = encoded["input_ids"].shape[-1]
+    eos_id = generator.model.generation_config.eos_token_id
+    if eos_id is None:
+        eos_id = generator.tokenizer.eos_token_id
     start = time.perf_counter()
     output = generator.model.generate(
         **encoded,
         max_new_tokens=max_new_tokens,
         do_sample=False,
         pad_token_id=generator.tokenizer.pad_token_id,
-        eos_token_id=generator.tokenizer.eos_token_id,
+        eos_token_id=eos_id,
     )
     if torch.cuda.is_available():
         torch.cuda.synchronize()

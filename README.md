@@ -1,180 +1,128 @@
 # REVA: Reusable Evidence View Aggregation
 
-Artifact repository for:
-
 > **REVA: Reusable Evidence View Aggregation for Context-Efficient RAG Serving**  
 > Accepted at **IEEE ICDM 2026**.
 
-REVA is a post-retrieval compression pipeline for retrieval-augmented generation (RAG). Instead of compressing every request from scratch, REVA mines historical query-document-model interactions into reusable document evidence views. At serving time, it looks up stored word-unit scores, materializes a budget-specific plain-text context, and sends that context to the same downstream generator.
-
-The RAG interface stays ordinary: the generator receives text. REVA does not require KV-cache APIs, latent memory, or generator architecture changes.
-
-## Pipeline
+REVA compresses retrieved documents using reusable word-unit scores mined from historical RAG requests. The generator receives plain text; no architecture or KV-cache changes are required.
 
 ![REVA pipeline](figures/reva_pipeline.png)
 
-Offline, completed RAG requests are scored with the target generator's attention. Token scores are mapped into readable word units and averaged across repeated document accesses to build a document-keyed score store. Online, a new request retrieves top-$K$ documents, reuses stored word scores when available, falls back to prefix truncation for unseen documents, and renders selected word units under the requested budget.
+## Setup
 
-## Data Artifacts
+Run commands from the repository root:
 
-Temporary Google Drive links are provided until the Zenodo DOI is ready:
+```bash
+uv sync --locked
+export PYTHONPATH=src
+```
 
-- [Retrieval top-20 artifact](https://drive.google.com/file/d/1buhg89g4n5j4tGiDj_94K1F0bflNzhFb/view?usp=sharing)
-- [REVA compact score cache](https://drive.google.com/file/d/1vO7EmnzyV2-Fqg8KudX-oT2haiwY8uPe/view?usp=sharing)
+Optional dependencies: `uv sync --locked --extra retrieval` for corpus/index preparation, or `--extra baselines` for baseline wrappers.
 
-Recommended local layout after download:
+## Data
+
+- [Retrieval top-20 with answers](https://drive.google.com/file/d/1buhg89g4n5j4tGiDj_94K1F0bflNzhFb/view?usp=sharing): NQ, TriviaQA, HotpotQA, and 2WikiMultihopQA.
+- [REVA score cache](https://drive.google.com/file/d/1vO7EmnzyV2-Fqg8KudX-oT2haiwY8uPe/view?usp=sharing): precomputed word-unit scores for REVA.
+
+Place the artifacts under `data/`:
 
 ```text
 data/
   retrieval_top20_4datasets_with_answers.jsonl.gz
   score_cache_reva_v1/
-    score_cache_manifest.json
-    score_cache_verify.tsv
-    score_cache_checksums.sha256
     scores_reva_v1__llama31__qpa__reversed__topk10.jsonl.gz
-    scores_reva_v1__llama31__q__reversed__topk10.jsonl.gz
-    scores_reva_v1__qwen35__qpa__reversed__topk10.jsonl.gz
-    scores_reva_v1__qwen35__q__reversed__topk10.jsonl.gz
-    scores_reva_v1__gemma4e4b__qpa__reversed__topk10.jsonl.gz
-    scores_reva_v1__gemma4e4b__q__reversed__topk10.jsonl.gz
+    ...
 ```
 
-Verify the score-cache download:
+Use the tokenizer matching each cache:
+
+| Cache model | Model/tokenizer |
+| --- | --- |
+| `llama31` | `meta-llama/Llama-3.1-8B-Instruct` |
+| `qwen35` | `Qwen/Qwen3.5-9B` |
+| `gemma4e4b` | `google/gemma-4-E4B-it` |
+
+Retrieval rows contain document IDs, not text. Download the FlashRAG wiki18 corpus and E5 model:
 
 ```bash
-cd data/score_cache_reva_v1
-shasum -a 256 -c score_cache_checksums.sha256
+uv run --extra retrieval python -m cli retrieval-build \
+  --stage download --data-root retrieval_artifacts
 ```
 
-The retrieval artifact stores question metadata and retrieved document IDs:
+The corpus is extracted to `retrieval_artifacts/corpora/wiki18_100w/wiki18_100w.jsonl`. Use `--stage all` instead to also encode passages and build the E5/FAISS index.
 
-```json
-{"dataset":"nq","split":"test","id":"test_0","question":"...","answers":["..."],"doc_ids":["..."]}
-```
+## Run
 
-The compact score cache stores one row per scored document:
-
-```json
-{"dataset":"nq","doc_id":"10000220","hits":9,"scores":[0.0,0.0,0.000031]}
-```
-
-The `scores` array contains word-unit scores. To render compressed text, pair these scores with the corresponding document text and the same REVA word-unit reconstruction code.
-
-## Repository Layout
-
-```text
-src/
-  cli.py              command-line entrypoint
-  schema.py           examples, contexts, JSON/JSONL helpers
-  models.py           prompt formatting, model loading, generation
-  metrics.py          token counts, EM/F1/ROUGE-L, summaries
-  runner.py           shared benchmark loop
-  methods.py          method registry
-  baselines.py        raw, truncation, and thin baseline wrappers
-  reva.py             REVA scoring, score-store construction, selection, rendering
-  retrieval_build.py  wiki18/E5 retrieval artifact builder
-```
-
-The main implementation is [src/reva.py](src/reva.py). The primary method IDs are `reva` and `reva_query_aware`.
-
-## Setup
+Compress NQ test queries with the released Llama Q+A cache:
 
 ```bash
-uv sync --locked
+uv run python -m cli run \
+  --input data/retrieval_top20_4datasets_with_answers.jsonl.gz \
+  --corpus retrieval_artifacts/corpora/wiki18_100w/wiki18_100w.jsonl \
+  --dataset nq --split test --top-k 10 --limit 10 \
+  --method reva --budget 512 \
+  --option scoring_model_name=meta-llama/Llama-3.1-8B-Instruct \
+  --option score_store_path=data/score_cache_reva_v1/scores_reva_v1__llama31__qpa__reversed__topk10.jsonl.gz \
+  --output outputs/reva_nq_b512
 ```
 
-Optional extras:
+This loads only the tokenizer. Add `--model meta-llama/Llama-3.1-8B-Instruct` for generation and EM/F1/ROUGE-L evaluation. Remove `--limit` for the full split; use `--split dev` for HotpotQA and 2WikiMultihopQA. Outputs are `records.jsonl` and `summary.json`.
+
+For query-aware scoring without a cache, use `--method reva_query_aware` and omit `score_store_path`.
+
+## Build Scores
+
+Build a Q+A/reversed store from training retrieval:
 
 ```bash
-uv sync --locked --extra retrieval   # FAISS/E5 retrieval build
-uv sync --locked --extra baselines   # optional baseline wrappers
-```
-
-Run commands from the repository root with `PYTHONPATH=src`.
-
-## Input Format
-
-The benchmark runner expects JSONL rows with a question and retrieved contexts:
-
-```json
-{"id":"q1","question":"...","answers":["..."],"contexts":[{"doc_id":"d1","title":"...","text":"...","chunk_id":"..."}]}
-```
-
-Use a stable `chunk_id` when multiple chunks share a `doc_id`.
-
-## Quick Start
-
-Build a native REVA score store from historical or training retrieval examples:
-
-```bash
-PYTHONPATH=src uv run python -m cli build-store \
-  --input data/train.jsonl \
+uv run python -m cli build-store \
+  --input data/retrieval_top20_4datasets_with_answers.jsonl.gz \
+  --corpus retrieval_artifacts/corpora/wiki18_100w/wiki18_100w.jsonl \
+  --dataset nq --split train --top-k 10 \
   --model meta-llama/Llama-3.1-8B-Instruct \
+  --option scoring_mode=query_plus_answer \
+  --option scoring_doc_order=reversed \
   --option max_scoring_tokens=8192 \
   --output outputs/reva_store
 ```
 
-Run REVA from a prebuilt store:
+Outputs are `score_store.jsonl.gz` and `summary.json` (model and scoring settings). To use this store, set `score_store_path=outputs/reva_store/score_store.jsonl.gz` in the run command.
 
-```bash
-PYTHONPATH=src uv run python -m cli run \
-  --input data/test.jsonl \
-  --method reva \
-  --budget 512 \
-  --option score_store_path=outputs/reva_store/score_store.jsonl \
-  --output outputs/reva_b512
+Scoring options apply to `build-store` and `reva_query_aware`:
+
+- `scoring_mode`: `query_only` (default) or `query_plus_answer`. Q+A requires `source_response` or the first non-empty `answers` entry, in that order.
+- `scoring_doc_order`: `original` (default) or `reversed`; output documents retain retrieval order.
+- `query_weight` / `answer_weight`: default to `0.5` / `0.5` in Q+A mode; query-only uses Q alone.
+
+Use historical responses or training answers to build Q+A stores. Serving with `reva` never reads the new query's answer; query-aware Q+A with evaluation answers is an oracle diagnostic.
+
+## Formats
+
+Inputs and score stores support JSONL or `.jsonl.gz`. Released retrieval rows:
+
+```json
+{"dataset":"nq","split":"test","id":"q1","question":"...","answers":["..."],"doc_ids":["d1"]}
 ```
 
-Run the query-aware diagnostic variant without a prebuilt store:
+Pass `--corpus` to join IDs to text. Alternatively, replace `doc_ids` with inline `contexts`:
 
-```bash
-PYTHONPATH=src uv run python -m cli run \
-  --input data/test.jsonl \
-  --method reva_query_aware \
-  --budget 512 \
-  --option scoring_model_name=meta-llama/Llama-3.1-8B-Instruct \
-  --output outputs/reva_query_aware_b512
+```json
+{"dataset":"nq","id":"q1","question":"...","answers":["..."],"contexts":[{"doc_id":"d1","title":"...","text":"..."}]}
 ```
 
-`build-store` writes `score_store.jsonl` and `summary.json`. `run` writes `records.jsonl` and `summary.json`. Add `--model ...` to `run` when you also want answer generation and EM/F1/ROUGE-L evaluation.
+Each compact score row stores one document, keyed by `(dataset, doc_id)`:
 
-## Retrieval Build
-
-`retrieval-build` prepares the wiki18/E5 retrieval artifacts used by the paper pipeline:
-
-```bash
-PYTHONPATH=src uv run --extra retrieval python -m cli retrieval-build \
-  --stage all \
-  --data-root retrieval_artifacts
+```json
+{"dataset":"nq","doc_id":"d1","hits":9,"scores":[0.0,0.0,0.000031]}
 ```
 
-The builder downloads the wiki18 corpus, encodes passages with `intfloat/e5-base-v2`, and builds a FAISS Flat inner-product index. You can also run `--stage download`, `--stage encode`, or `--stage index` separately.
+`hits` counts training accesses; `scores[i]` is the mean score of word unit `i`. Include `dataset` in input rows or pass `--dataset`. For multiple chunks of one document, provide a stable `chunk_id`, which is also saved in the cache. Older stores with explicit `word_units` remain readable; unlabelled stores must be used with one dataset at a time.
 
-## How Scores Are Used
+## How It Works
 
-REVA stores scores at word-unit granularity. A word unit is an alphanumeric span aligned to tokenizer offsets:
+1. **Score:** Documents precede the question and optional known response. Attention is averaged over heads/layers and summed over source tokens; Q+A mixes separately computed Q and A scores. The first four tokens of documents longer than four tokens are excluded from scoring. No per-document max normalization is applied.
+2. **Aggregate:** Tokenizer pieces form word units, with names, dates, and grouped numbers merged. Unit scores use the maximum token score by default, then average across document accesses and are saved to six decimals. Scoring and cache loading share the same unit builder, using the original text/tokenizer and a trailing double newline.
+3. **Serve:** Select high-scoring units within document quotas and render in original order. Unseen documents use prefix truncation. Rendered text, including document separators, stays within `--budget`.
 
-```text
-Doc: "Paris is the capital of France."
+Illustrative selection: `Paris is the capital of France` -> select `Paris`, `France`, `capital` by score -> render `Paris capital France`.
 
-index  unit      score
-0      Paris     0.91
-1      is        0.08
-2      the       0.03
-3      capital   0.77
-4      of        0.04
-5      France    0.88
-```
-
-Under a small budget, REVA selects high-score word units, then renders them in the original document order:
-
-```text
-Selected by score: Paris, France, capital
-Rendered context:  Paris capital France
-```
-
-Documents missing from the score store use prefix truncation under the same document quota.
-
-## Citation
-
-Citation metadata, DOI, and a public paper link will be added when the official ICDM 2026 proceedings or arXiv page is available.
+Core implementation: [src/reva.py](src/reva.py). [src/cli.py](src/cli.py) exposes the commands, [src/runner.py](src/runner.py) runs evaluation, and [src/baselines.py](src/baselines.py) contains baseline wrappers.

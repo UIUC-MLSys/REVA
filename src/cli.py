@@ -37,6 +37,9 @@ def parser() -> argparse.ArgumentParser:
     build.add_argument("--model", default=None)
     build.add_argument("--limit", type=non_negative_int, default=None)
     build.add_argument("--top-k", type=non_negative_int, default=None)
+    build.add_argument("--corpus", help="JSONL corpus for retrieval doc_ids")
+    build.add_argument("--dataset", help="filter dataset, or label a single-dataset input")
+    build.add_argument("--split", help="filter split, or label a single-split input")
     build.add_argument("--option", action="append", type=option_text, default=[])
 
     retrieval = commands.add_parser("retrieval-build")
@@ -55,6 +58,9 @@ def parser() -> argparse.ArgumentParser:
     bench.add_argument("--model", default=None)
     bench.add_argument("--limit", type=non_negative_int, default=None)
     bench.add_argument("--top-k", type=non_negative_int, default=None)
+    bench.add_argument("--corpus", help="JSONL corpus for retrieval doc_ids")
+    bench.add_argument("--dataset", help="filter dataset, or label a single-dataset input")
+    bench.add_argument("--split", help="filter split, or label a single-split input")
     bench.add_argument("--max-new-tokens", type=positive_int, default=32)
     bench.add_argument("--option", action="append", type=option_text, default=[])
     return root
@@ -95,6 +101,9 @@ def main() -> int:
             options=options,
             limit=args.limit,
             top_k=args.top_k,
+            corpus_path=args.corpus,
+            dataset=args.dataset,
+            split=args.split,
         )
         print(summary)
     elif args.command == "retrieval-build":
@@ -129,6 +138,9 @@ def main() -> int:
             limit=args.limit,
             top_k=args.top_k,
             max_new_tokens=args.max_new_tokens,
+            corpus_path=args.corpus,
+            dataset=args.dataset,
+            split=args.split,
         )
         print(summary)
     return 0

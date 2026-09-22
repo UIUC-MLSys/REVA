@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-import json
+import math
 import re
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -11,13 +11,30 @@ from transformers import AutoModelForCausalLM, AutoTokenizer
 
 from baselines import result, truncate_text
 from metrics import token_count
-from schema import CompressionResult, Compressor, Context, Example, load_examples, write_json, write_jsonl
+from schema import CompressionResult, Compressor, Context, Example, load_examples, read_jsonl, write_json, write_jsonl
 
 WORD_RE = re.compile(r"[A-Za-z0-9]+")
+PREFIX_TOKENS = 4
+MONTHS = (
+    "January|February|March|April|May|June|July|August|September|October|November|December|"
+    "Jan|Feb|Mar|Apr|Jun|Jul|Aug|Sep|Sept|Oct|Nov|Dec"
+)
+SEMANTIC_RE = re.compile(
+    rf"\d{{1,2}}\s+(?:{MONTHS})\s+\d{{2,4}}"
+    rf"|(?:{MONTHS})\s+\d{{1,2}},?\s+\d{{2,4}}"
+    r"|\d{1,3}(?:,\d{3})+(?:\.\d+)?%?"
+    r"|[A-Z][A-Za-z0-9]*(?:[-'][A-Za-z0-9]+)*(?:\s+[A-Z][A-Za-z0-9]*(?:[-'][A-Za-z0-9]+)*)+"
+)
+
+
+def chunk_key(doc_id: Any, chunk_id: Any = None) -> str:
+    chunk = "" if chunk_id is None else str(chunk_id).strip()
+    return f"{doc_id}::chunk={chunk}" if chunk else str(doc_id)
 
 
 def doc_key(context: Context) -> str:
-    return f"{context.doc_id}::chunk={context.chunk_id}" if context.chunk_id else context.doc_id
+    key = chunk_key(context.doc_id, context.chunk_id)
+    return f"{context.dataset}::{key}" if context.dataset else key
 
 
 def optional_int(value: Any) -> int | None:
@@ -65,6 +82,22 @@ class REVAConfig:
     head_top_k: int = 3
     query_aggregation: str = "sum"
     word_score: str = "max"
+    scoring_mode: str = "query_only"
+    scoring_doc_order: str = "original"
+    query_weight: float = 0.5
+    answer_weight: float = 0.5
+
+    def __post_init__(self) -> None:
+        if self.scoring_mode not in {"query_only", "query_plus_answer"}:
+            raise ValueError("scoring_mode must be query_only or query_plus_answer")
+        if self.scoring_doc_order not in {"original", "reversed"}:
+            raise ValueError("scoring_doc_order must be original or reversed")
+        if self.scoring_mode == "query_only":
+            self.query_weight, self.answer_weight = 1.0, 0.0
+        if any(not math.isfinite(weight) or weight < 0 for weight in (self.query_weight, self.answer_weight)):
+            raise ValueError("query_weight and answer_weight must be finite and non-negative")
+        if self.query_weight + self.answer_weight == 0:
+            raise ValueError("query_weight and answer_weight cannot both be zero")
 
 
 @dataclass(slots=True)
@@ -76,9 +109,10 @@ class PromptDoc:
 
 @dataclass(slots=True)
 class PromptInput:
-    text: str
+    token_ids: list[int]
     docs: list[PromptDoc]
-    source_ranges: list[tuple[int, int]]
+    query_positions: list[int]
+    answer_positions: list[int]
 
 
 @dataclass(slots=True)
@@ -94,7 +128,6 @@ class WordUnit:
     score: float = 0.0
     score_sum: float = 0.0
     score_count: int = 0
-    prompt_positions: list[int] = field(default_factory=list)
 
 
 @dataclass(slots=True)
@@ -116,25 +149,35 @@ class ScoreDoc:
     units: list[WordUnit]
     chunk_id: str | None = None
     raw_text: str = ""
+    scores: list[float] | None = None
+    hits: int = 0
 
 
 @dataclass(slots=True)
 class ScoreStore:
     docs: dict[str, ScoreDoc]
+    compact: bool = False
 
     def find(self, context: Context) -> ScoreDoc | None:
-        return self.docs.get(doc_key(context))
+        doc = self.docs.get(doc_key(context))
+        if doc is not None:
+            return doc
+        if self.compact and not context.dataset:
+            raise ValueError("compact scores require a dataset; pass --dataset or include it in input rows")
+        if context.dataset and chunk_key(context.doc_id, context.chunk_id) in self.docs:
+            raise ValueError("unscoped scores require loading with contexts from a single dataset")
+        return None
 
 
 @dataclass(slots=True)
 class SelectionResult:
     docs: list[DocumentUnits]
     quotas: list[int]
+    budget: int | None = None
 
 
 @dataclass(slots=True)
 class DocAggregate:
-    key: str
     context: Context
     units: list[WordUnit]
     query_count: int = 0
@@ -175,36 +218,21 @@ def config_meta(config: REVAConfig) -> dict[str, Any]:
         "head_top_k": config.head_top_k,
         "query_aggregation": config.query_aggregation,
         "word_score": config.word_score,
-        "word_unit_type": "tokenizer_offset_words",
-        "score_normalization": "per_query_doc_max",
+        "word_unit_type": "tokenizer_word_starts_semantic",
+        "scoring_mode": config.scoring_mode,
+        "scoring_doc_order": config.scoring_doc_order,
+        "query_weight": config.query_weight,
+        "answer_weight": config.answer_weight,
+        "prompt_tokenization": "segments",
+        "score_normalization": "none",
+        "exclude_first_n_per_chunk": PREFIX_TOKENS,
     }
 
 
-def context_header(context: Context) -> str:
-    rank = "" if context.rank is None else str(context.rank)
+def context_header(context: Context, rank: int) -> str:
+    rank = rank if context.rank is None else context.rank
     title = f" | title={context.title}" if context.title else ""
     return f"[DOC {rank} | id={context.doc_id}{title}]".strip()
-
-
-def build_scoring_prompt(example: Example, contexts: list[Context] | None = None) -> PromptInput:
-    text = "Contexts:\n"
-    docs = []
-    for context in (list(example.contexts) if contexts is None else contexts):
-        text += context_header(context) + "\n"
-        start = len(text)
-        body = context.text.strip()
-        text += body
-        end = len(text)
-        text += "\n\n"
-        docs.append(PromptDoc(context, start, end))
-
-    text += "Question:\n"
-    query_start = len(text)
-    text += example.question.strip()
-    query_end = len(text)
-    text += "\n\n"
-    source_ranges = [(query_start, query_end)]
-    return PromptInput(text, docs, source_ranges)
 
 
 def flat_list(values: Any) -> list[Any]:
@@ -218,27 +246,58 @@ def tokenize_with_offsets(tokenizer: Any, text: str) -> tuple[list[int], list[tu
     return input_ids, [(int(start), int(end)) for start, end in offsets]
 
 
-def overlaps(start: int, end: int, target_start: int, target_end: int) -> bool:
-    return end > start and start < target_end and end > target_start
+def document_text(text: str) -> str:
+    return text.strip() + "\n\n"
 
 
-def positions_in_ranges(offsets: list[tuple[int, int]], ranges: list[tuple[int, int]]) -> list[int]:
-    return [
-        index
-        for index, (start, end) in enumerate(offsets)
-        if any(overlaps(start, end, target_start, target_end) for target_start, target_end in ranges)
-    ]
+def scoring_answer(example: Example, config: REVAConfig) -> str | None:
+    if config.scoring_mode == "query_only":
+        return None
+    if example.source_response and example.source_response.strip():
+        return example.source_response.strip()
+    answer = next((str(answer).strip() for answer in example.answers or [] if str(answer).strip()), None)
+    if answer is None:
+        raise ValueError(f"example {example.id!r}: query_plus_answer requires source_response or a non-empty answer")
+    return answer
 
 
-def count_tokens(tokenizer: Any, text: str) -> int:
-    token_ids, _offsets = tokenize_with_offsets(tokenizer, text)
-    return len(token_ids)
+def build_scoring_prompt(
+    example: Example,
+    tokenizer: Any,
+    config: REVAConfig,
+    contexts: list[Context] | None = None,
+) -> PromptInput:
+    if not example.question.strip():
+        raise ValueError(f"example {example.id!r}: attention scoring requires a non-empty question")
+    answer = scoring_answer(example, config)
+    token_ids = tokenizer.encode("Contexts:\n", add_special_tokens=False)
+    docs = []
+    indexed = list(enumerate(example.contexts if contexts is None else contexts, start=1))
+    if config.scoring_doc_order == "reversed":
+        indexed.reverse()
+    for rank, context in indexed:
+        token_ids.extend(tokenizer.encode(context_header(context, rank) + "\n", add_special_tokens=False))
+        start = len(token_ids)
+        token_ids.extend(tokenizer.encode(document_text(context.text), add_special_tokens=False))
+        docs.append(PromptDoc(context, start, len(token_ids)))
+
+    token_ids.extend(tokenizer.encode("Question:\n", add_special_tokens=False))
+    query_start = len(token_ids)
+    token_ids.extend(tokenizer.encode(document_text(example.question), add_special_tokens=False))
+    query_positions = list(range(query_start, len(token_ids)))
+    answer_positions = []
+    if answer is not None:
+        token_ids.extend(tokenizer.encode("Known response:\n", add_special_tokens=False))
+        answer_start = len(token_ids)
+        token_ids.extend(tokenizer.encode(document_text(answer), add_special_tokens=False))
+        answer_positions = list(range(answer_start, len(token_ids)))
+    return PromptInput(token_ids, docs, query_positions, answer_positions)
 
 
 def limited_scoring_prompt(example: Example, tokenizer: Any, config: REVAConfig) -> tuple[PromptInput, dict[str, Any]]:
     contexts = list(example.contexts)
-    prompt = build_scoring_prompt(example, contexts)
-    before = count_tokens(tokenizer, prompt.text)
+    prompt = build_scoring_prompt(example, tokenizer, config, contexts)
+    before = len(prompt.token_ids)
     limit = resolve_max_scoring_tokens(tokenizer, config)
     meta = {
         "max_scoring_tokens": limit,
@@ -253,10 +312,10 @@ def limited_scoring_prompt(example: Example, tokenizer: Any, config: REVAConfig)
 
     dropped = 0
     while contexts:
-        contexts = contexts[1:]
+        contexts = contexts[:-1] if config.scoring_doc_order == "reversed" else contexts[1:]
         dropped += 1
-        prompt = build_scoring_prompt(example, contexts)
-        current = count_tokens(tokenizer, prompt.text)
+        prompt = build_scoring_prompt(example, tokenizer, config, contexts)
+        current = len(prompt.token_ids)
         if current <= limit:
             meta.update({
                 "scoring_prompt_tokens": current,
@@ -281,66 +340,90 @@ def aggregate(values: list[float], mode: str) -> float:
     raise ValueError("word_score must be one of: max, mean, sum")
 
 
-def normalize_scores(units: list[WordUnit]) -> list[WordUnit]:
-    max_score = max((unit.score for unit in units), default=0.0)
-    if max_score > 0:
-        for unit in units:
-            unit.score = round(unit.score / max_score, 6)
-    return units
+def join_units(units: list[WordUnit]) -> str:
+    text = ""
+    for unit in units:
+        piece = unit.text.strip()
+        if not piece:
+            continue
+        previous = text.rsplit(" ", 1)[-1]
+        number = previous[:-1].isdigit() and piece.isdigit()
+        joins_number = number and (text.endswith(".") or (text.endswith(",") and len(piece) == 3))
+        if not text:
+            text = piece
+        elif piece in {".", ",", ";", ":", ")", "]", "}"} or text.endswith(("-", "'", "/", "(", "[", "{")) or joins_number:
+            text += piece
+        else:
+            text += " " + piece
+    return text
 
 
-def build_word_units(text: str, tokenizer: Any | None = None) -> list[WordUnit]:
-    if tokenizer is None:
-        return [
-            WordUnit(match.group(0), index, match.start(), match.end(), index, index + 1)
-            for index, match in enumerate(WORD_RE.finditer(text))
-        ]
-    token_ids, offsets = tokenize_with_offsets(tokenizer, text)
+def build_word_units(
+    text: str,
+    tokenizer: Any,
+    scores: list[float] | None = None,
+    word_score: str = "max",
+) -> list[WordUnit]:
+    # Scoring and cache reconstruction use exactly the same document token sequence.
+    token_ids, offsets = tokenize_with_offsets(tokenizer, document_text(text))
+    pieces = tokenizer.convert_ids_to_tokens(token_ids)
+    starts = [0] + [
+        index for index, piece in enumerate(pieces)
+        if index and (piece[:1].isspace() or piece.startswith(("\u0120", "\u2581")))
+    ]
+    leading = len(text) - len(text.lstrip())
     units = []
-    for index, match in enumerate(WORD_RE.finditer(text)):
-        positions = positions_in_ranges(offsets, [(match.start(), match.end())])
-        if positions:
-            start = positions[0]
-            end = positions[-1] + 1
-            ids = token_ids[start:end]
-            units.append(WordUnit(match.group(0), index, match.start(), match.end(), start, end, ids, len(ids)))
-    return units
+    for index, (start, end) in enumerate(zip(starts, starts[1:] + [len(token_ids)])):
+        first = pieces[start].replace("\u0120", " ").replace("\u2581", " ")
+        if first.startswith("##"):
+            first = first[2:]
+        tail = "".join(piece.replace("\u0120", "").replace("\u2581", "").replace("##", "") for piece in pieces[start + 1:end])
+        units.append(WordUnit(
+            text=(first.strip() + tail).strip(),
+            index=index,
+            char_start=min(len(text), leading + offsets[start][0]),
+            char_end=min(len(text), leading + offsets[end - 1][1]),
+            token_start=start,
+            token_end=end,
+            token_ids=token_ids[start:end],
+            token_count=end - start,
+            score=aggregate(scores[start:end], word_score) if scores is not None else 0.0,
+        ))
+
+    merged = []
+    index = 0
+    while index < len(units):
+        best_end = index + 1
+        for end in range(index + 2, min(len(units), index + 8) + 1):
+            candidate = " ".join(join_units(units[index:end]).split())
+            if SEMANTIC_RE.fullmatch(candidate) or SEMANTIC_RE.fullmatch(candidate.rstrip(".;:")):
+                best_end = end
+        group = units[index:best_end]
+        start, end = group[0].token_start, group[-1].token_end
+        merged.append(WordUnit(
+            text=join_units(group),
+            index=len(merged),
+            char_start=group[0].char_start,
+            char_end=group[-1].char_end,
+            token_start=start,
+            token_end=end,
+            token_ids=token_ids[start:end],
+            token_count=end - start,
+            score=max(unit.score for unit in group),
+        ))
+        index = best_end
+    return merged
 
 
 def build_prompt_word_units(
-    prompt: str,
     prompt_doc: PromptDoc,
-    token_ids: list[int],
-    offsets: list[tuple[int, int]],
+    tokenizer: Any,
     scores: dict[int, float],
     config: REVAConfig,
 ) -> DocumentUnits:
-    doc_positions = positions_in_ranges(offsets, [(prompt_doc.start, prompt_doc.end)])
-    local_position = {position: index for index, position in enumerate(doc_positions)}
-    units = []
-    for index, match in enumerate(WORD_RE.finditer(prompt, prompt_doc.start, prompt_doc.end)):
-        positions = positions_in_ranges(offsets, [(match.start(), match.end())])
-        if not positions:
-            continue
-        local_start = local_position[positions[0]]
-        local_end = local_position[positions[-1]] + 1
-        ids = [token_ids[position] for position in positions]
-        values = [scores.get(position, 0.0) for position in positions]
-        units.append(
-            WordUnit(
-                text=match.group(0),
-                index=index,
-                char_start=match.start() - prompt_doc.start,
-                char_end=match.end() - prompt_doc.start,
-                token_start=local_start,
-                token_end=local_end,
-                token_ids=ids,
-                token_count=len(ids),
-                score=aggregate(values, config.word_score),
-                prompt_positions=positions,
-            )
-        )
-    return DocumentUnits(prompt_doc.context, normalize_scores(units), "prompt", len(doc_positions))
+    values = [scores.get(position, 0.0) for position in range(prompt_doc.start, prompt_doc.end)]
+    units = build_word_units(prompt_doc.context.text, tokenizer, values, config.word_score)
+    return DocumentUnits(prompt_doc.context, units, "prompt", len(values))
 
 
 def select_layers(attentions: tuple[Any, ...] | list[Any], subset: Any) -> list[Any]:
@@ -395,14 +478,14 @@ def run_attentions(model: Any, token_ids: list[int]) -> Any:
     return outputs.attentions
 
 
-def token_scores(
+def source_scores(
     attentions: tuple[Any, ...] | list[Any],
     source_positions: list[int],
     document_positions: list[int],
     config: REVAConfig,
-) -> dict[int, float]:
+) -> Any:
     if not source_positions or not document_positions:
-        return {position: 0.0 for position in document_positions}
+        return torch.zeros(len(document_positions))
     layer_scores = []
     layers = select_layers(attentions, config.layer_subset)
     if not layers:
@@ -413,24 +496,52 @@ def token_scores(
         source_index = torch.tensor(source_positions, dtype=torch.long, device=device)
         document_index = torch.tensor(document_positions, dtype=torch.long, device=device)
         scores = attention[0].index_select(1, source_index).index_select(2, document_index)
-        layer_scores.append(reduce_sources(reduce_heads(scores, config), config))
-    values = torch.stack(layer_scores).mean(dim=0).detach().cpu().tolist()
+        layer_scores.append(reduce_sources(reduce_heads(scores, config), config).cpu())
+    return torch.stack(layer_scores).mean(dim=0)
+
+
+def token_scores(
+    attentions: tuple[Any, ...] | list[Any],
+    source_positions: list[int],
+    document_positions: list[int],
+    config: REVAConfig,
+    answer_positions: list[int] | None = None,
+) -> dict[int, float]:
+    scores = source_scores(attentions, source_positions, document_positions, config)
+    if config.scoring_mode == "query_plus_answer" and answer_positions:
+        answer_scores = source_scores(attentions, answer_positions, document_positions, config)
+        scores = (config.query_weight * scores + config.answer_weight * answer_scores) / (config.query_weight + config.answer_weight)
+    values = scores.tolist()
     return {position: round(float(value), 6) for position, value in zip(document_positions, values)}
 
 
 def score_prompt_with_meta(example: Example, tokenizer: Any, model: Any, config: REVAConfig) -> ScoredDocs:
     prompt, meta = limited_scoring_prompt(example, tokenizer, config)
-    token_ids, offsets = tokenize_with_offsets(tokenizer, prompt.text)
-    document_positions = positions_in_ranges(offsets, [(doc.start, doc.end) for doc in prompt.docs])
-    source_positions = positions_in_ranges(offsets, prompt.source_ranges)
-    if not source_positions:
+    # Match the released scorer: suppress the first four tokens without removing their units.
+    document_positions = [
+        position for doc in prompt.docs
+        for position in range(doc.start + (PREFIX_TOKENS if doc.end - doc.start > PREFIX_TOKENS else 0), doc.end)
+    ]
+    if not prompt.query_positions:
         raise ValueError("reva could not find query tokens for attention scoring")
-    if document_positions and min(source_positions) <= max(document_positions):
+    if document_positions and min(prompt.query_positions) <= max(document_positions):
         raise ValueError("reva scoring prompt must place query tokens after document tokens")
-    scores = token_scores(run_attentions(model, token_ids), source_positions, document_positions, config)
-    docs = [build_prompt_word_units(prompt.text, doc, token_ids, offsets, scores, config) for doc in prompt.docs]
+    scores = token_scores(
+        run_attentions(model, prompt.token_ids), prompt.query_positions, document_positions, config, prompt.answer_positions,
+    )
+    docs = [build_prompt_word_units(doc, tokenizer, scores, config) for doc in prompt.docs]
+    if config.scoring_doc_order == "reversed":
+        docs.reverse()
     meta["scored_document_tokens"] = len(document_positions)
-    meta["source_tokens"] = len(source_positions)
+    meta["source_tokens"] = len(prompt.query_positions) + len(prompt.answer_positions)
+    meta["query_tokens"] = len(prompt.query_positions)
+    meta["answer_tokens"] = len(prompt.answer_positions)
+    meta["scoring_mode"] = config.scoring_mode
+    meta["scoring_doc_order"] = config.scoring_doc_order
+    meta["query_weight"] = config.query_weight
+    meta["answer_weight"] = config.answer_weight
+    if config.scoring_mode == "query_plus_answer":
+        meta["scoring_answer_source"] = "source_response" if example.source_response and example.source_response.strip() else "answers"
     return ScoredDocs(docs, meta)
 
 
@@ -440,7 +551,21 @@ def unit_score(row: dict[str, Any]) -> float:
     return float(row.get("score", 0.0))
 
 
+def score_key(row: dict[str, Any]) -> str:
+    if "scores" in row:
+        if not row.get("dataset"):
+            raise ValueError("compact score-store rows require dataset")
+        key = chunk_key(row["doc_id"], row.get("chunk_id"))
+        return f"{row['dataset']}::{key}"
+    key = str(row.get("doc_key") or row.get("id") or chunk_key(row["doc_id"], row.get("chunk_id")))
+    if row.get("dataset") and not key.startswith(f"{row['dataset']}::"):
+        key = f"{row['dataset']}::{key}"
+    return key
+
+
 def parse_score_doc(row: dict[str, Any]) -> ScoreDoc:
+    if "scores" not in row and "word_units" not in row:
+        raise ValueError("score-store rows must contain scores or word_units")
     units = [
         WordUnit(
             text=str(unit["text"]),
@@ -459,13 +584,14 @@ def parse_score_doc(row: dict[str, Any]) -> ScoreDoc:
         if str(unit.get("text", "")).strip()
     ]
     doc_id = str(row.get("doc_id") or row.get("id"))
-    key = str(row.get("doc_key") or row.get("id") or doc_id)
     return ScoreDoc(
         doc_id=doc_id,
-        key=key,
+        key=score_key(row),
         units=units,
-        chunk_id=None if row.get("chunk_id") is None else str(row["chunk_id"]),
+        chunk_id=None if row.get("chunk_id") is None else str(row["chunk_id"]).strip() or None,
         raw_text=str(row.get("raw_text", "")),
+        scores=[float(score) for score in row["scores"]] if "scores" in row else None,
+        hits=int(row.get("hits", row.get("score_store_meta", {}).get("training_hits", 0))),
     )
 
 
@@ -488,7 +614,7 @@ def copy_store_unit(unit: WordUnit) -> WordUnit:
 def add_to_aggregates(aggregates: dict[str, DocAggregate], doc: DocumentUnits) -> None:
     key = doc_key(doc.context)
     if key not in aggregates:
-        aggregates[key] = DocAggregate(key, doc.context, [copy_store_unit(unit) for unit in doc.units])
+        aggregates[key] = DocAggregate(doc.context, [copy_store_unit(unit) for unit in doc.units])
     aggregate = aggregates[key]
     if aggregate.context.text != doc.context.text:
         raise ValueError(f"doc_key={key!r} maps to different context text")
@@ -506,40 +632,16 @@ def add_to_aggregates(aggregates: dict[str, DocAggregate], doc: DocumentUnits) -
     aggregate.query_count += 1
 
 
-def score_doc_row(aggregate: DocAggregate, config: REVAConfig) -> dict[str, Any]:
-    return {
-        "id": aggregate.key,
-        "doc_key": aggregate.key,
+def score_doc_row(aggregate: DocAggregate) -> dict[str, Any]:
+    row = {
+        "dataset": aggregate.context.dataset,
         "doc_id": aggregate.context.doc_id,
-        "chunk_id": aggregate.context.chunk_id,
-        "title": aggregate.context.title,
-        "raw_text": aggregate.context.text,
-        "word_units": [
-            {
-                "index": unit.index,
-                "text": unit.text,
-                "char_start": unit.char_start,
-                "char_end": unit.char_end,
-                "token_start": unit.token_start,
-                "token_end": unit.token_end,
-                "token_ids": unit.token_ids,
-                "token_count": unit.token_count,
-                "score_sum": round(unit.score_sum, 6),
-                "score_count": unit.score_count,
-                "score": round(unit.score, 6),
-            }
-            for unit in aggregate.units
-        ],
-        "score_store_meta": {
-            "scoring": "mean_attention",
-            "score_normalization": "per_query_doc_max",
-            "word_unit_type": "tokenizer_offset_words",
-            "training_hits": aggregate.query_count,
-            "raw_tokens": sum(unit.token_count for unit in aggregate.units),
-            "raw_units": len(aggregate.units),
-            "scoring_model_name": config.scoring_model_name,
-        },
+        "hits": aggregate.query_count,
+        "scores": [round(unit.score, 6) for unit in aggregate.units],
     }
+    if aggregate.context.chunk_id:
+        row["chunk_id"] = aggregate.context.chunk_id
+    return row
 
 
 def validate_score_doc(score_doc: ScoreDoc, context: Context) -> None:
@@ -551,7 +653,20 @@ def validate_score_doc(score_doc: ScoreDoc, context: Context) -> None:
         raise ValueError(f"score_store key={score_doc.key!r} has different raw_text")
 
 
-def reconstruct_units(score_doc: ScoreDoc) -> list[WordUnit]:
+def reconstruct_units(score_doc: ScoreDoc, context: Context, tokenizer: Any | None = None) -> list[WordUnit]:
+    if score_doc.scores is not None and not score_doc.units:
+        if tokenizer is None:
+            raise ValueError("compact scores require the original tokenizer; pass --model or --option scoring_model_name=MODEL")
+        units = build_word_units(context.text, tokenizer)
+        if len(units) != len(score_doc.scores):
+            raise ValueError(
+                f"score-store key={score_doc.key!r}: {len(score_doc.scores)} scores but {len(units)} word units; "
+                "use the original corpus text and scoring model tokenizer"
+            )
+        for unit, score in zip(units, score_doc.scores):
+            unit.score = score
+        score_doc.units = units
+        score_doc.raw_text = context.text
     return [
         WordUnit(
             unit.text,
@@ -595,7 +710,7 @@ def select_docwise(docs: list[DocumentUnits], budget: int | None, config: REVACo
         DocumentUnits(doc.context, top_units(doc.units, quotas[index]), doc.source, doc.raw_tokens)
         for index, doc in enumerate(docs)
     ]
-    return SelectionResult(selected, quotas)
+    return SelectionResult(selected, quotas, budget)
 
 
 def select(docs: list[DocumentUnits], budget: int | None, config: REVAConfig) -> SelectionResult:
@@ -627,10 +742,21 @@ def render_units(doc: DocumentUnits) -> str:
     return " ".join(doc.context.text[start:end].strip() for start, end in merged if doc.context.text[start:end].strip())
 
 
-def render_docs(selection: SelectionResult) -> str:
+def render_docs(selection: SelectionResult, tokenizer: Any | None = None) -> str:
     parts = []
-    for doc in selection.docs:
-        text = render_units(doc)
+    for doc, quota in zip(selection.docs, selection.quotas):
+        text = truncate_text(doc.context.text, quota, tokenizer) if doc.source == "fallback" else render_units(doc)
+        # Retokenization and document separators can exceed the selected units' token cost.
+        while text and (
+            token_count(text, tokenizer) > quota
+            or (selection.budget is not None and token_count("\n\n".join([*parts, text]), tokenizer) > selection.budget)
+        ):
+            if doc.source == "fallback":
+                quota = max(0, quota - 1)
+                text = truncate_text(doc.context.text, quota, tokenizer)
+            else:
+                doc.units.remove(min(doc.units, key=lambda unit: (unit.score, -unit.index)))
+                text = render_units(doc)
         if text:
             parts.append(text)
     return "\n\n".join(parts).strip()
@@ -644,7 +770,7 @@ def selection_meta(selection: SelectionResult, text: str, tokenizer: Any | None 
         "allocation": "docwise",
         "documents": len(selection.docs),
         "score_store_hits": store_hits,
-        "fallback_documents": len(selection.docs) - store_hits,
+        "fallback_documents": sum(doc.source == "fallback" for doc in selection.docs),
         "realized_budget": rendered_tokens,
         "selected_unit_tokens": selected_unit_tokens,
         "rendered_tokens": rendered_tokens,
@@ -652,19 +778,39 @@ def selection_meta(selection: SelectionResult, text: str, tokenizer: Any | None 
 
 
 def render_selection(selection: SelectionResult, tokenizer: Any | None = None) -> tuple[str, dict[str, Any]]:
-    text = render_docs(selection)
+    text = render_docs(selection, tokenizer)
     return text, selection_meta(selection, text, tokenizer)
 
 
-def load_score_store(path: str | Path) -> ScoreStore:
+def load_score_store(path: str | Path, contexts: list[Context] | None = None) -> ScoreStore:
     docs = {}
-    for line in Path(path).expanduser().read_text(encoding="utf-8").splitlines():
-        if line.strip():
-            doc = parse_score_doc(json.loads(line))
-            if doc.key in docs:
-                raise ValueError(f"duplicate score_store key: {doc.key}")
-            docs[doc.key] = doc
-    return ScoreStore(docs)
+    compact = False
+    wanted = None if contexts is None else {doc_key(context) for context in contexts}
+    if wanted == set():
+        return ScoreStore(docs)
+    unscoped = {chunk_key(context.doc_id, context.chunk_id) for context in contexts or []}
+    datasets = {context.dataset for context in contexts or []}
+    missing_dataset = {chunk_key(context.doc_id, context.chunk_id) for context in contexts or [] if not context.dataset}
+    for row in read_jsonl(path):
+        compact = compact or "scores" in row
+        if "scores" in row and chunk_key(row["doc_id"], row.get("chunk_id")) in missing_dataset:
+            raise ValueError("compact scores are dataset-specific; pass --dataset or include dataset in every input row")
+        key = score_key(row)
+        if wanted is not None and key not in wanted and not (not row.get("dataset") and key in unscoped):
+            continue
+        doc = parse_score_doc(row)
+        if not row.get("dataset") and key in unscoped:
+            if len(datasets) > 1:
+                raise ValueError("unscoped scores require a single dataset; run each dataset separately")
+            dataset = next(iter(datasets))
+            if dataset:
+                doc.key = f"{dataset}::{key}"
+        if doc.key in docs:
+            raise ValueError(f"duplicate score_store key: {doc.key}")
+        docs[doc.key] = doc
+    # An all-unseen compact cache still needs its tokenizer for prefix fallback.
+    compact = any(doc.scores is not None for doc in docs.values()) if docs else compact
+    return ScoreStore(docs, compact)
 
 
 def load_scoring_model(config: REVAConfig) -> tuple[Any, Any]:
@@ -706,6 +852,10 @@ def read_config(options: dict[str, Any] | None, budget: int | None, model_name: 
         head_top_k=int(options.get("head_top_k", 3)),
         query_aggregation=str(options.get("query_aggregation", "sum")),
         word_score=str(options.get("word_score", options.get("word_unit_score_aggregation", "max"))),
+        scoring_mode=str(options.get("scoring_mode", "query_only")).strip().lower(),
+        scoring_doc_order=str(options.get("scoring_doc_order", "original")).strip().lower(),
+        query_weight=float(options.get("query_weight", 0.5)),
+        answer_weight=float(options.get("answer_weight", 0.5)),
     )
 
 
@@ -716,15 +866,22 @@ def build_store(
     options: dict[str, Any] | None = None,
     limit: int | None = None,
     top_k: int | None = None,
+    corpus_path: str | Path | None = None,
+    dataset: str | None = None,
+    split: str | None = None,
 ) -> dict[str, Any]:
     if limit is not None and limit < 0:
         raise ValueError("limit must be non-negative")
     if top_k is not None and top_k < 0:
         raise ValueError("top_k must be non-negative")
     config = read_config(options, None, model_name)
-    tokenizer, model = load_scoring_model(config)
     aggregates: dict[str, DocAggregate] = {}
-    examples = load_examples(input_path, limit, top_k)
+    examples = load_examples(input_path, limit, top_k, corpus_path, dataset, split)
+    if any(not example.dataset for example in examples):
+        raise ValueError("build-store requires --dataset or dataset in every input row")
+    for example in examples:
+        scoring_answer(example, config)
+    tokenizer, model = load_scoring_model(config)
     truncated_queries = 0
     dropped_documents = 0
     for example in examples:
@@ -735,18 +892,22 @@ def build_store(
             add_to_aggregates(aggregates, doc)
 
     output_dir = Path(output_dir).expanduser()
-    rows = [score_doc_row(aggregates[key], config) for key in sorted(aggregates)]
-    write_jsonl(output_dir / "score_store.jsonl", rows)
+    store_path = output_dir / "score_store.jsonl.gz"
+    write_jsonl(store_path, (score_doc_row(aggregates[key]) for key in sorted(aggregates)))
     summary = {
         "queries": len(examples),
-        "documents": len(rows),
+        "documents": len(aggregates),
         "scoring": "attention",
         "scoring_model_name": config.scoring_model_name,
         "reva_config": config_meta(config),
+        "score_store_schema": ["dataset", "doc_id", "hits", "scores"],
+        "top_k": top_k,
         "scoring_prompt_truncated_queries": truncated_queries,
         "scoring_dropped_documents": dropped_documents,
-        "score_store_path": str(output_dir / "score_store.jsonl"),
+        "score_store_path": str(store_path),
     }
+    if any(aggregate.context.chunk_id for aggregate in aggregates.values()):
+        summary["score_store_schema"].append("chunk_id")
     write_json(output_dir / "summary.json", summary)
     return summary
 
@@ -771,25 +932,33 @@ class REVAQueryAwareCompressor(Compressor):
 
 
 class REVAOfflineCompressor(Compressor):
-    def __init__(self, config, tokenizer: Any | None = None, model_name: str | None = None) -> None:
+    def __init__(self, config, tokenizer: Any | None = None, model_name: str | None = None, contexts: list[Context] | None = None) -> None:
         super().__init__(config, tokenizer, model_name)
         self.reva_config = read_config(config.options, config.budget, model_name)
         if not self.reva_config.score_store_path:
             raise ValueError("reva requires --option score_store_path=PATH")
-        self.store = load_score_store(str(self.reva_config.score_store_path))
+        self.store = load_score_store(str(self.reva_config.score_store_path), contexts)
+        self.store_tokenizer = tokenizer
+        name = self.reva_config.scoring_model_name
+        if name and (tokenizer is None or name != model_name):
+            self.store_tokenizer = AutoTokenizer.from_pretrained(name, use_fast=True, trust_remote_code=True)
+        if self.store.compact:
+            if self.store_tokenizer is None:
+                raise ValueError("compact scores require --model or --option scoring_model_name=MODEL")
+            if not self.store_tokenizer.is_fast:
+                raise ValueError("compact scores require a fast tokenizer for offset mapping")
+        self.tokenizer = self.tokenizer or self.store_tokenizer
 
     def compress(self, example: Example) -> CompressionResult:
         docs = []
         for context in example.contexts:
             score_doc = self.store.find(context)
             if score_doc is None:
-                text = truncate_text(context.text, self.reva_config.per_doc_quota or self.config.budget, self.tokenizer)
-                units = build_word_units(text, self.tokenizer)
                 raw_tokens = token_count(context.text, self.tokenizer)
-                docs.append(DocumentUnits(context, units, "fallback", raw_tokens))
+                docs.append(DocumentUnits(context, [], "fallback", raw_tokens))
             else:
                 validate_score_doc(score_doc, context)
-                units = reconstruct_units(score_doc)
+                units = reconstruct_units(score_doc, context, self.store_tokenizer)
                 docs.append(DocumentUnits(context, units, "score_store", sum(unit.token_count for unit in units)))
         text, meta = render_selection(select(docs, self.reva_config.budget, self.reva_config), self.tokenizer)
         meta["score_store_path"] = self.reva_config.score_store_path
